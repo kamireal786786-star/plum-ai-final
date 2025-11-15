@@ -1,172 +1,131 @@
+// components/Chatbot.tsx
+import React, { useState, useEffect, useRef } from 'react';
+import { sendMessageToGemini } from '../services/geminiService';
+import * as calendarService from '../services/calendarService';
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { ChatMessage } from '../types';
-import { createChatSession, sendMessageToGemini } from '../services/geminiService';
-import { BotIcon } from './icons/BotIcon';
-import { SendIcon } from './icons/SendIcon';
-import { CloseIcon } from './icons/CloseIcon';
-import { Chat } from '@google/genai';
-import { MeetingDetails } from '../App';
-
-interface ChatbotProps {
-  onMeetingScheduled: (details: MeetingDetails) => void;
+interface Message {
+  from: 'user' | 'bot';
+  text: string;
 }
 
-const Chatbot: React.FC<ChatbotProps> = ({ onMeetingScheduled }) => {
-    const [isOpen, setIsOpen] = useState(false);
-    const [messages, setMessages] = useState<ChatMessage[]>([
-        { role: 'model', content: "Hello! I'm PlumBot. How can I help you explore our AI services today?" }
-    ]);
-    const [inputValue, setInputValue] = useState('');
-    const [isLoading, setIsLoading] = useState(false);
+const Chatbot: React.FC = () => {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [awaitingBooking, setAwaitingBooking] = useState<{ date?: string; time?: string; name?: string; email?: string } | null>(null);
+  const ref = useRef<HTMLDivElement | null>(null);
 
-    const chatSession = useRef<Chat | null>(null);
-    const messagesEndRef = useRef<HTMLDivElement>(null);
-    const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  }, [messages, loading]);
 
-    useEffect(() => {
-        if (!chatSession.current) {
-            chatSession.current = createChatSession();
-        }
-    }, []);
+  const pushMessage = (m: Message) => setMessages(prev => [...prev, m]);
 
-    const scrollToBottom = () => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    };
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text) return;
+    pushMessage({ from: 'user', text });
+    setInput('');
+    setLoading(true);
 
-    useEffect(scrollToBottom, [messages]);
+    try {
+      // Ask the server-side Gemini for a reply
+      const reply = await sendMessageToGemini(text);
+      pushMessage({ from: 'bot', text: reply });
 
-    // Effect to auto-focus the input field when the chat opens or after the bot responds.
-    useEffect(() => {
-        if (isOpen && !isLoading) {
-            // Use a small timeout to allow for UI transitions before focusing.
-            setTimeout(() => inputRef.current?.focus(), 100);
-        }
-    }, [isOpen, isLoading]);
+      // Basic heuristic: if user asked to schedule, start flow (you can refine this)
+      if (/schedule|meeting|book|appointment/i.test(text)) {
+        pushMessage({ from: 'bot', text: 'Sure — what date would you like to check? (YYYY-MM-DD)' });
+      }
+    } catch (err: any) {
+      console.error('Chat error', err);
+      pushMessage({ from: 'bot', text: 'Sorry — something went wrong. Try again later.' });
+    } finally {
+      setLoading(false);
+    }
+  };
 
+  // simplified booking flow handlers (UI can call these)
+  const checkSlotsForDate = async (date: string) => {
+    pushMessage({ from: 'user', text: date });
+    pushMessage({ from: 'bot', text: 'Checking available slots...' });
+    setLoading(true);
+    const slots = await calendarService.getAvailableSlots(date);
+    setLoading(false);
 
-    const handleSendMessage = useCallback(async () => {
-        if (!inputValue.trim() || isLoading) return;
+    if (typeof slots === 'string') {
+      pushMessage({ from: 'bot', text: slots }); // error message
+      return;
+    }
 
-        const userMessage: ChatMessage = { role: 'user', content: inputValue.trim() };
-        setMessages(prev => [...prev, userMessage]);
-        setInputValue('');
-        setIsLoading(true);
+    if (Array.isArray(slots) && slots.length === 0) {
+      pushMessage({ from: 'bot', text: 'No slots available on that date. Try another date.' });
+      return;
+    }
 
-        if (chatSession.current) {
-            const response = await sendMessageToGemini(chatSession.current, userMessage.content);
-            const modelMessage: ChatMessage = { role: 'model', content: response };
-            setMessages(prev => [...prev, modelMessage]);
+    // show list and ask to pick
+    const listText = slots.map(s => `- ${s}`).join('\n');
+    pushMessage({ from: 'bot', text: `Available times for ${date}:\n${listText}\nPlease reply with your preferred time (HH:MM).` });
+    setAwaitingBooking({ date });
+  };
 
-            // Check for successful booking and trigger the modal
-            if (response.startsWith("Success!")) {
-                const bookingRegex = /for (.*) on ([\d-]+) at ([\d:]+)\. A confirmation email has been sent to (.*)\./;
-                const match = response.match(bookingRegex);
-                if (match) {
-                    const [, name, date, time, email] = match;
-                    onMeetingScheduled({ name, date, time, email });
-                }
-            }
-        }
-        
-        setIsLoading(false);
-    }, [inputValue, isLoading, onMeetingScheduled]);
+  const confirmAndSchedule = async (time: string) => {
+    if (!awaitingBooking?.date) {
+      pushMessage({ from: 'bot', text: 'Please provide a date first (YYYY-MM-DD).' });
+      return;
+    }
+    // Ask for name & email (simple flow)
+    pushMessage({ from: 'user', text: time });
+    pushMessage({ from: 'bot', text: 'Please provide your full name.' });
+    setAwaitingBooking({ ...awaitingBooking, time });
+    // Next steps: expecting name and email from user messages — for brevity this demo asks sequentially
+  };
 
-    const toggleChat = () => setIsOpen(!isOpen);
+  // For a production flow, you would implement a structured modal or form to collect name/email/time,
+  // then call calendarService.scheduleMeeting(date, time, name, email)
 
-    const renderMessageContent = (content: string) => {
-        // Replace markdown links [text](url) with HTML <a> tags
-        const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
-        const contentWithLinks = content.replace(linkRegex, '<a href="$2" target="_blank" rel="noopener noreferrer" class="text-purple-400 underline hover:text-purple-300">$1</a>');
-        
-        // Use dangerouslySetInnerHTML. This is safe as we are only transforming specific markdown into trusted HTML.
-        return <div className="text-sm break-words" dangerouslySetInnerHTML={{ __html: contentWithLinks.replace(/\n/g, '<br />') }} />;
-    };
-    
-    return (
-        <>
-            <button
-                onClick={toggleChat}
-                className="fixed bottom-6 right-6 bg-purple-600 text-white p-4 rounded-full shadow-lg hover:bg-purple-700 transition-transform duration-300 hover:scale-110 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 focus:ring-offset-gray-900 z-50"
-                aria-label="Toggle Chatbot"
-            >
-                {isOpen ? <CloseIcon className="w-6 h-6"/> : <BotIcon className="w-6 h-6" />}
-            </button>
-
-            <div
-                className={`fixed inset-x-4 bottom-24 h-[60vh] sm:inset-x-auto sm:right-6 sm:w-full sm:max-w-sm flex flex-col bg-gray-800/80 backdrop-blur-xl rounded-2xl shadow-2xl border border-gray-700/50 z-50 transition-all duration-300 ease-in-out ${isOpen ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4 pointer-events-none'
-                    }`}
-            >
-                <header className="flex items-center justify-between p-4 border-b border-gray-700">
-                    <div className="flex items-center space-x-3">
-                        <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-fuchsia-600 rounded-full flex items-center justify-center">
-                            <BotIcon className="w-6 h-6 text-white"/>
-                        </div>
-                        <div>
-                            <h3 className="font-bold text-white">PlumBot Assistant</h3>
-                            <p className="text-sm text-gray-400">Online</p>
-                        </div>
-                    </div>
-                    <button onClick={toggleChat} className="text-gray-400 hover:text-white">
-                        <CloseIcon className="w-6 h-6"/>
-                    </button>
-                </header>
-
-                <div className="flex-1 p-4 overflow-y-auto">
-                    <div className="space-y-4">
-                        {messages.map((msg, index) => (
-                            <div key={index} className={`flex items-end gap-2 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                {msg.role === 'model' && <div className="w-8 h-8 bg-gray-700 rounded-full flex-shrink-0 flex items-center justify-center"><BotIcon className="w-5 h-5 text-gray-300" /></div>}
-                                <div
-                                    className={`max-w-xs md:max-w-sm px-4 py-2 rounded-2xl ${msg.role === 'user'
-                                            ? 'bg-purple-600 text-white rounded-br-none'
-                                            : 'bg-gray-700 text-gray-200 rounded-bl-none'
-                                        }`}
-                                >
-                                    {renderMessageContent(msg.content)}
-                                </div>
-                            </div>
-                        ))}
-                        {isLoading && (
-                            <div className="flex items-end gap-2 justify-start">
-                                <div className="w-8 h-8 bg-gray-700 rounded-full flex-shrink-0 flex items-center justify-center"><BotIcon className="w-5 h-5 text-gray-300" /></div>
-                                <div className="bg-gray-700 text-gray-200 rounded-2xl rounded-bl-none px-4 py-3">
-                                    <div className="flex items-center justify-center space-x-1">
-                                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-                                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-                                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-                        <div ref={messagesEndRef} />
-                    </div>
-                </div>
-
-                <div className="p-4 border-t border-gray-700">
-                    <div className="flex items-center bg-gray-700 rounded-lg">
-                        <input
-                            ref={inputRef}
-                            type="text"
-                            value={inputValue}
-                            onChange={(e) => setInputValue(e.target.value)}
-                            onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
-                            placeholder="Ask about our services..."
-                            className="w-full bg-transparent p-3 text-white placeholder-gray-400 focus:outline-none"
-                            disabled={isLoading}
-                        />
-                        <button
-                            onClick={handleSendMessage}
-                            disabled={isLoading || !inputValue.trim()}
-                            className="p-3 text-white disabled:text-gray-500 enabled:hover:text-purple-400 transition-colors"
-                        >
-                            <SendIcon className="w-6 h-6" />
-                        </button>
-                    </div>
-                </div>
+  return (
+    <div className="chatbot border rounded p-4 bg-white max-w-lg">
+      <div ref={ref} className="messages h-64 overflow-auto mb-3">
+        {messages.map((m, i) => (
+          <div key={i} className={`mb-2 ${m.from === 'user' ? 'text-right' : 'text-left'}`}>
+            <div className={`inline-block p-2 rounded ${m.from === 'user' ? 'bg-indigo-500 text-white' : 'bg-gray-100 text-gray-900'}`}>
+              <pre className="whitespace-pre-wrap">{m.text}</pre>
             </div>
-        </>
-    );
+          </div>
+        ))}
+        {loading && <div className="text-gray-500">Thinking…</div>}
+      </div>
+
+      <div className="flex gap-2">
+        <input
+          className="flex-1 border px-3 py-2 rounded"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              // special flow: if awaitingBooking expects a date/time or name, handle basic parsing
+              const t = input.trim();
+              if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
+                checkSlotsForDate(t);
+                setInput('');
+              } else if (/^\d{2}:\d{2}$/.test(t) && awaitingBooking?.date && !awaitingBooking?.time) {
+                // user picked time
+                confirmAndSchedule(t);
+                setInput('');
+              } else {
+                handleSend();
+              }
+            }
+          }}
+          placeholder="Type a message…"
+        />
+        <button className="px-4 py-2 bg-indigo-600 text-white rounded" onClick={handleSend} disabled={loading}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
 };
 
 export default Chatbot;

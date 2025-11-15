@@ -1,185 +1,117 @@
+// services/calendarService.ts
+// Now: uses client-side settings to calculate available slots,
+// but asks server for busy periods (via /api/google/freebusy).
+// Booking uses /api/google/schedule (server-side).
+
 import * as settingsService from './settingsService';
-import * as googleCalendarApiService from './googleCalendarApiService';
-import * as emailService from './emailService';
-import * as authManager from './authManager';
 
-const NOT_CONNECTED_ERROR = "Error: Google Calendar is not connected. Please go to the Admin page to connect your account.";
+const NOT_CONNECTED_ERROR = "Error: Scheduling temporarily unavailable. Admin not connected.";
 
-/**
- * Gets available meeting slots for a given date using Google Calendar and user-defined settings.
- * @param date The date in YYYY-MM-DD format.
- * @returns An array of available time slots in HH:MM format, or an error message.
- */
+interface BusySlot { start: string; end: string; }
+
 export const getAvailableSlots = async (date: string): Promise<string[] | string> => {
-  console.log(`Checking available slots for: ${date}`);
-  const token = authManager.getToken();
-  if (!token) {
-    return NOT_CONNECTED_ERROR;
-  }
-
   try {
+    // Load calendar settings (local client-side config)
     const settings = settingsService.getCalendarSettings();
-    
-    // Use noon to avoid timezone issues with getDay()
-    const dateObj = new Date(`${date}T12:00:00Z`);
-    const dayIndex = dateObj.getUTCDay(); // 0 = Sunday, 1 = Monday...
+
+    // Build day schedule
+    const dateObj = new Date(`${date}T12:00:00`); // avoid timezone math on day
+    const dayIndex = dateObj.getDay(); // 0=Sunday
     const daySchedule = settings.schedule[dayIndex];
 
-    if (!daySchedule.enabled) {
-      return []; // Not a working day
+    if (!daySchedule || !daySchedule.enabled) {
+      return []; // not a working day
     }
-    
-    // Check for a full-day exclusion on this date
+
+    // check full-day exclusion
     const allDayExclusion = settings.exclusions.find(ex => ex.date === date && ex.allDay);
-    if (allDayExclusion) {
-      return []; // Day is fully blocked
+    if (allDayExclusion) return [];
+
+    const meetingDuration = settings.meetingDuration;
+    const startStr = daySchedule.start; // "09:00"
+    const endStr = daySchedule.end;     // "17:00"
+
+    // time window in ISO to pass to server freebusy
+    const timeMin = new Date(`${date}T${startStr}:00`).toISOString();
+    const timeMax = new Date(`${date}T${endStr}:00`).toISOString();
+
+    // Call server to get busy slots (server will use stored refresh token)
+    const base = (typeof window !== 'undefined' && window.location?.origin) ? window.location.origin : '';
+    const fbResp = await fetch(`${base}/api/google/freebusy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timeMin, timeMax }),
+    });
+
+    if (!fbResp.ok) {
+      const txt = await fbResp.text();
+      console.error('freebusy endpoint error', fbResp.status, txt);
+      return `Error: Failed to retrieve calendar availability (status ${fbResp.status})`;
     }
 
-    const { start, end } = daySchedule;
-    const { meetingDuration } = settings;
+    const busyFromServer: BusySlot[] = await fbResp.json();
 
-    const timeMin = new Date(`${date}T${start}:00`);
-    const timeMax = new Date(`${date}T${end}:00`);
-
-    // Get busy slots from Google Calendar
-    const busySlotsFromGoogle = await googleCalendarApiService.getFreeBusy(token, timeMin.toISOString(), timeMax.toISOString());
-    
-    // Get time-based exclusions for this date from settings
+    // Convert client-side time exclusions to ISO ranges
     const timeExclusions = settings.exclusions
       .filter(ex => ex.date === date && !ex.allDay && ex.start && ex.end)
-      .map(ex => ({
-        start: new Date(`${date}T${ex.start}:00`).toISOString(),
-        end: new Date(`${date}T${ex.end}:00`).toISOString(),
-      }));
-    
-    const combinedBusySlots = [...busySlotsFromGoogle, ...timeExclusions];
+      .map(ex => ({ start: new Date(`${date}T${ex.start}:00`).toISOString(), end: new Date(`${date}T${ex.end}:00`).toISOString() }));
 
+    const combinedBusy = [...busyFromServer, ...timeExclusions];
+
+    // iterate through the day windows to create slots
     const availableSlots: string[] = [];
-    let currentSlot = new Date(timeMin.getTime());
+    let current = new Date(`${date}T${startStr}:00`);
 
-    while (currentSlot.getTime() < timeMax.getTime()) {
-      const slotEnd = new Date(currentSlot.getTime() + meetingDuration * 60 * 1000);
-      
-      const isBusy = combinedBusySlots.some(busy =>
-        (new Date(busy.start) < slotEnd) && (new Date(busy.end) > currentSlot)
-      );
+    const endDate = new Date(`${date}T${endStr}:00`);
 
-      if (!isBusy && slotEnd.getTime() <= timeMax.getTime()) {
-        const hours = String(currentSlot.getHours()).padStart(2, '0');
-        const minutes = String(currentSlot.getMinutes()).padStart(2, '0');
-        availableSlots.push(`${hours}:${minutes}`);
+    while (current.getTime() + meetingDuration * 60000 <= endDate.getTime()) {
+      const slotEnd = new Date(current.getTime() + meetingDuration * 60000);
+
+      const isBusy = combinedBusy.some(b => {
+        const bStart = new Date(b.start);
+        const bEnd = new Date(b.end);
+        return bStart < slotEnd && bEnd > current;
+      });
+
+      if (!isBusy) {
+        const hh = String(current.getHours()).padStart(2, '0');
+        const mm = String(current.getMinutes()).padStart(2, '0');
+        availableSlots.push(`${hh}:${mm}`);
       }
-      
-      currentSlot = new Date(currentSlot.getTime() + meetingDuration * 60 * 1000);
+
+      // step forward by meetingDuration
+      current = new Date(current.getTime() + meetingDuration * 60000);
     }
 
     return availableSlots;
-
-  } catch (error: any) {
-    console.error("Error getting available slots:", error);
-    const errorMessage = error instanceof Error ? error.message : "An unknown error occurred while fetching calendar slots.";
-    return `Error: ${errorMessage}`;
+  } catch (err: any) {
+    console.error('getAvailableSlots error', err);
+    return `Error: ${err?.message || 'Unknown error while fetching slots'}`;
   }
 };
 
-
-/**
- * Schedules a meeting using Google Calendar API.
- * @param date The date of the meeting in YYYY-MM-DD format.
- * @param time The time of the meeting in HH:MM format.
- * @param name The name of the client.
- * @param email The email of the client.
- * @returns A confirmation message string or an error message.
- */
-export const scheduleMeeting = async (date: string, time: string, name:string, email: string): Promise<string> => {
-    console.log(`Attempting to schedule meeting for ${name} at ${date} ${time} via Google Calendar`);
-    const token = authManager.getToken();
-    if (!token) {
-        return NOT_CONNECTED_ERROR;
-    }
-
-    try {
-        const adminProfile = authManager.getUserProfile();
-        if (!adminProfile || !adminProfile.email) {
-            return "Error: Admin user profile not found or email is missing. Please reconnect the Google Account on the Admin page.";
-        }
-
-        const settings = settingsService.getCalendarSettings();
-        const meetingDuration = settings.meetingDuration;
-
-        const startTime = new Date(`${date}T${time}:00`);
-        const endTime = new Date(startTime.getTime() + meetingDuration * 60000);
-
-        const eventDetails = {
-            summary: `Meeting with ${name}`,
-            description: `Discovery call with ${name} (${email}) to discuss AI solutions. Scheduled via PlumBot.`,
-            start: {
-                dateTime: startTime.toISOString(),
-                timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            },
-            end: {
-                dateTime: endTime.toISOString(),
-                timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            },
-            attendees: [{ email: email }, { email: adminProfile.email }],
-        };
-
-        await googleCalendarApiService.createEvent(token, eventDetails);
-        
-        await emailService.sendMeetingConfirmationEmails({
-            name,
-            email,
-            date,
-            time,
-            adminEmail: adminProfile.email,
-            meetingDuration,
-        });
-
-        const confirmationMessage = `Success! A meeting has been scheduled for ${name} on ${date} at ${time}. A confirmation email has been sent to ${email}.`;
-        console.log(confirmationMessage);
-        return confirmationMessage;
-    } catch (error: any) {
-        console.error("Error scheduling meeting via Google Calendar:", error);
-        const errorMessage = error instanceof Error ? error.message : "Could not schedule the meeting. The time slot may have just been taken or there was a configuration error.";
-        return `Error: ${errorMessage}`;
-    }
-};
-
-
-export interface UpcomingMeeting {
-    id: string;
-    summary: string;
-    start: string; // ISO string
-    end: string;   // ISO string
-    hangoutLink?: string;
-    attendees: Array<{ email: string, responseStatus: string }>;
-}
-
-/**
- * Fetches upcoming meetings scheduled by the bot from the user's Google Calendar.
- * @returns A promise that resolves to an array of meetings or an error string.
- */
-export const getUpcomingMeetings = async (): Promise<UpcomingMeeting[] | string> => {
-  const token = authManager.getToken();
-  if (!token) {
-    return "Error: Google Account not connected.";
-  }
-
+export const scheduleMeeting = async (date: string, time: string, name: string, email: string): Promise<string> => {
   try {
-    const now = new Date().toISOString();
-    // Use a specific query to find meetings scheduled by the bot
-    const events = await googleCalendarApiService.listEvents(token, now, "Scheduled via PlumBot"); 
-    
-    return events.map(event => ({
-      id: event.id,
-      summary: event.summary,
-      start: event.start.dateTime || event.start.date,
-      end: event.end.dateTime || event.end.date,
-      hangoutLink: event.hangoutLink,
-      attendees: (event.attendees || []).filter((a: any) => !a.self), // Filter out the admin's own attendance
-    }));
-  } catch (error: any) {
-    console.error("Error fetching upcoming meetings:", error);
-    return `Error: ${error.message}`;
+    const base = (typeof window !== 'undefined' && window.location?.origin) ? window.location.origin : '';
+    const resp = await fetch(`${base}/api/google/schedule`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, date, time }),
+    });
+
+    const json = await resp.json();
+    if (!resp.ok) {
+      console.error('scheduleMeeting server error', resp.status, json);
+      return `Error: Failed to schedule meeting (${json?.error || resp.status})`;
+    }
+
+    if (json.success) {
+      return `Success! A meeting has been scheduled for ${name} on ${date} at ${time}.`;
+    } else {
+      return `Error: ${json?.error || 'Unknown scheduling error'}`;
+    }
+  } catch (err: any) {
+    console.error('scheduleMeeting error', err);
+    return `Error: ${err?.message || 'Unable to schedule meeting'}`;
   }
 };
